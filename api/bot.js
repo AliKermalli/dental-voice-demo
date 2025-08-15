@@ -1,44 +1,73 @@
+// api/bot.js
 import OpenAI from "openai";
+
+// Read raw form body in Vercel Node API (no req.text())
+function readFormBody(req) {
+  return new Promise((resolve, reject) => {
+    let data = "";
+    req.on("data", (chunk) => (data += chunk));
+    req.on("end", () => {
+      try {
+        resolve(new URLSearchParams(data || ""));
+      } catch (e) {
+        reject(e);
+      }
+    });
+    req.on("error", reject);
+  });
+}
 
 const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-// tiny helper – safe text extraction from OpenAI Responses API
 async function askOpenAI(userText, context) {
   const sys = `You are a concise, friendly dental office phone assistant for ${context.business}.
 - Hours: ${context.hours || "Mon–Fri 8am–5pm"}
 - New patient special: ${context.special || "$129 exam + x‑rays + basic cleaning"}
 - Services: ${context.services || "cleanings, exams, x‑rays, fillings, crowns, whitening, implants"}
 - Insurances accepted: ${context.insurance || "many PPO plans"}
-- If caller asks to talk to a person, politely confirm and we will transfer them.
-Keep replies short and conversational (1–2 sentences).`;
+If caller asks to talk to a person, say you'll connect them.
+Keep replies short (1–2 sentences), natural, and easy to speak.`;
 
   const resp = await client.responses.create({
-    model: "gpt-4o-mini", // low-latency, reliable
+    model: "gpt-4o-mini",
     input: [
       { role: "system", content: sys },
-      { role: "user", content: userText }
+      { role: "user", content: userText },
     ],
     temperature: 0.3,
   });
 
-  return (resp.output_text || "").trim();
+  return (resp?.output_text || "").trim();
 }
 
 export default async function handler(req, res) {
   if (req.method !== "POST") {
-    return res.status(405).send("Method Not Allowed");
+    res.status(405).send("Method Not Allowed");
+    return;
   }
 
   try {
-    // Twilio <Gather> posts form-encoded. Parse it:
-    const raw = await req.text();
-    const params = new URLSearchParams(raw);
-    const speech = params.get("SpeechResult") || params.get("speechResult") || "";
-    const base = process.env.PUBLIC_URL;
+    const base = process.env.PUBLIC_URL || "";
+    if (!process.env.OPENAI_API_KEY) {
+      // Fail-safe: forward if AI not configured
+      const twiml = `
+<Response>
+  <Say>Sorry, I'm having trouble right now. I'll connect you.</Say>
+  <Dial>${process.env.FORWARD_TO || process.env.TWILIO_PHONE_NUMBER || ""}</Dial>
+</Response>`.trim();
+      res.setHeader("Content-Type", "text/xml");
+      res.status(200).send(twiml);
+      return;
+    }
 
-    // If nothing was heard, reprompt
+    // Parse Twilio form data
+    const form = await readFormBody(req);
+    const speech =
+      (form.get("SpeechResult") || form.get("speechResult") || "").trim();
+
+    // If nothing heard, reprompt
     if (!speech) {
-      const reprompt = `
+      const twiml = `
 <Response>
   <Say>Sorry, I didn't catch that.</Say>
   <Gather input="speech" action="${base}/api/bot" method="POST" language="en-US" timeout="4">
@@ -47,10 +76,32 @@ export default async function handler(req, res) {
   <Redirect>${base}/api/voice</Redirect>
 </Response>`.trim();
       res.setHeader("Content-Type", "text/xml");
-      return res.status(200).send(reprompt);
+      res.status(200).send(twiml);
+      return;
     }
 
-    // Call OpenAI
+    // Human escalation keywords
+    const keywords =
+      (process.env.ESCALATION_KEYWORDS ||
+        "representative,person,manager,human,call back,call me").toLowerCase();
+    const wantsHuman = keywords
+      .split(",")
+      .map((k) => k.trim())
+      .filter(Boolean)
+      .some((k) => speech.toLowerCase().includes(k));
+
+    if (wantsHuman && (process.env.FORWARD_TO || process.env.TWILIO_PHONE_NUMBER)) {
+      const twiml = `
+<Response>
+  <Say>Connecting you now. Please hold.</Say>
+  <Dial>${process.env.FORWARD_TO || process.env.TWILIO_PHONE_NUMBER}</Dial>
+</Response>`.trim();
+      res.setHeader("Content-Type", "text/xml");
+      res.status(200).send(twiml);
+      return;
+    }
+
+    // Call OpenAI for a natural reply
     const text = await askOpenAI(speech, {
       business: process.env.BUSINESS_NAME || "BrightSmiles Dental",
       hours: process.env.HOURS_TEXT,
@@ -59,29 +110,13 @@ export default async function handler(req, res) {
       insurance: process.env.INSURANCE_TEXT,
     });
 
-    // If caller asks for a human (keywords), transfer
-    const needsHuman = (process.env.ESCALATION_KEYWORDS || "representative,person,manager,human,call back,call me").toLowerCase();
-    const wantsHuman = needsHuman.split(",").some(k => speech.toLowerCase().includes(k.trim()));
-
-    if (wantsHuman) {
-      const forwardTo = process.env.FORWARD_TO || process.env.TWILIO_PHONE_NUMBER;
-      const twiml = `
-<Response>
-  <Say>Connecting you now. Please hold.</Say>
-  <Dial>${forwardTo}</Dial>
-</Response>`.trim();
-      res.setHeader("Content-Type", "text/xml");
-      return res.status(200).send(twiml);
-    }
-
-    // Normal reply + keep the conversation going
+    // Speak the reply and keep the loop going
     const twiml = `
 <Response>
-  <Say>${text}</Say>
+  <Say>${text || "Sorry, could you repeat that?"}</Say>
   <Gather input="speech" action="${base}/api/bot" method="POST" language="en-US" timeout="4">
     <Say>Anything else?</Say>
   </Gather>
-  <Pause length="1"/>
   <Redirect>${base}/api/voice</Redirect>
 </Response>`.trim();
 
@@ -91,8 +126,8 @@ export default async function handler(req, res) {
     console.error("BOT ERROR:", err);
     const twiml = `
 <Response>
-  <Say>Sorry, I’m having trouble right now. I’ll transfer you.</Say>
-  <Dial>${process.env.FORWARD_TO || process.env.TWILIO_PHONE_NUMBER}</Dial>
+  <Say>Sorry, I'm having trouble right now. I'll connect you.</Say>
+  <Dial>${process.env.FORWARD_TO || process.env.TWILIO_PHONE_NUMBER || ""}</Dial>
 </Response>`.trim();
     res.setHeader("Content-Type", "text/xml");
     res.status(200).send(twiml);
