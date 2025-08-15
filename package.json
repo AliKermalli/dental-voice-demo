@@ -1,0 +1,9 @@
+{
+  "name": "dental-voice-demo",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "openai": "^4.0.0",
+    "qs": "^6.11.2"
+  }
+}
